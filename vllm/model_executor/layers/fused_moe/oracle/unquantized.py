@@ -227,6 +227,16 @@ def select_unquantized_moe_backend(
 
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = _get_priority_backends(moe_config)
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx12x
+
+        if on_gfx12x() and UnquantizedMoeBackend.AITER in AVAILABLE_BACKENDS:
+            logger.warning_once(
+                "ROCm AITER unquantized MoE is disabled on gfx12/RDNA4 "
+                "serving because unsupported shapes can fall through to CK. "
+                "Using Triton MoE instead."
+            )
+            AVAILABLE_BACKENDS.remove(UnquantizedMoeBackend.AITER)
 
     # NOTE(rob): We need to peak into the P/F selection to determine
     # if we are using the batched or standard expert format, which
@@ -292,8 +302,9 @@ def select_unquantized_moe_backend(
             if UnquantizedMoeBackend.AITER in AVAILABLE_BACKENDS:
                 AVAILABLE_BACKENDS.remove(UnquantizedMoeBackend.AITER)
         else:
-            backend = UnquantizedMoeBackend.AITER
-            return _return_or_raise(backend, moe_config, activation_format)
+            if UnquantizedMoeBackend.AITER in AVAILABLE_BACKENDS:
+                backend = UnquantizedMoeBackend.AITER
+                return _return_or_raise(backend, moe_config, activation_format)
 
     for backend in AVAILABLE_BACKENDS:
         for k_cls in backend_to_kernel_cls(backend):
