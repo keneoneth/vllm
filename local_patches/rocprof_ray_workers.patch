@@ -1,0 +1,112 @@
+diff --git a/vllm/ray/ray_env.py b/vllm/ray/ray_env.py
+index 4103b93172..93cd06c2a6 100644
+--- a/vllm/ray/ray_env.py
++++ b/vllm/ray/ray_env.py
+@@ -41,6 +41,10 @@ DEFAULT_ENV_VAR_PREFIXES: set[str] = {
+     "UCX_",
+     "HF_",
+     "HUGGING_FACE_",
++    # Required when external tooling needs to preload libraries into Ray workers.
++    "LD_",
++    "ROCP_",
++    "RAY_LD_",
+ }
+ 
+ DEFAULT_EXTRA_ENV_VARS: set[str] = {
+diff --git a/vllm/v1/executor/ray_env_utils.py b/vllm/v1/executor/ray_env_utils.py
+index 799cc4b84e..e42251ba7b 100644
+--- a/vllm/v1/executor/ray_env_utils.py
++++ b/vllm/v1/executor/ray_env_utils.py
+@@ -4,7 +4,16 @@ import os
+ 
+ from vllm.ray.ray_env import RAY_NON_CARRY_OVER_ENV_VARS
+ 
+-_RAY_WORKER_PRE_IMPORT_ENV_VARS = frozenset({"VLLM_USE_BREAKABLE_CUDAGRAPH"})
++_RAY_WORKER_PRE_IMPORT_ENV_VARS = frozenset(
++    {
++        "VLLM_USE_BREAKABLE_CUDAGRAPH",
++        # Required for rocprofv3 late-attach profiling on Ray worker actors.
++        "ROCP_TOOL_ATTACH",
++        "RAY_LD_PRELOAD_ON_WORKERS",
++        "LD_PRELOAD",
++        "LD_LIBRARY_PATH",
++    }
++)
+ 
+ 
+ def get_driver_env_vars(
+@@ -30,4 +39,18 @@ def update_runtime_env_for_worker_import(runtime_env: dict) -> dict:
+         if env_var in os.environ:
+             env_vars = runtime_env.setdefault("env_vars", {})
+             env_vars[env_var] = os.environ[env_var]
++
++    # Forward rocprof/rocprofiler startup instrumentation envs before the
++    # worker process imports ROCm/HIP runtimes. This is required when we want
++    # Ray workers to start already instrumented instead of relying on
++    # late-attach.
++    profiling_prefixes = ("ROCPROF_",)
++    profiling_exact = {
++        "ROCP_TOOL_LIBRARIES",
++        "ROCPROFILER_LIBRARY_CTOR",
++    }
++    for env_name, env_value in os.environ.items():
++        if env_name in profiling_exact or env_name.startswith(profiling_prefixes):
++            env_vars = runtime_env.setdefault("env_vars", {})
++            env_vars[env_name] = env_value
+     return runtime_env
+diff --git a/vllm/v1/executor/ray_executor_v2.py b/vllm/v1/executor/ray_executor_v2.py
+index 8f4b84ed0f..ce8ed8d989 100644
+--- a/vllm/v1/executor/ray_executor_v2.py
++++ b/vllm/v1/executor/ray_executor_v2.py
+@@ -48,6 +48,13 @@ else:
+ 
+ logger = init_logger(__name__)
+ 
++_ROCP_ATTACH_ENV_VARS = (
++    "ROCP_TOOL_ATTACH",
++    "RAY_LD_PRELOAD_ON_WORKERS",
++    "LD_PRELOAD",
++    "LD_LIBRARY_PATH",
++)
++
+ 
+ @dataclass
+ class RayWorkerHandle:
+@@ -434,6 +441,9 @@ class RayExecutorV2(MultiprocExecutor):
+             local_rank = node_workers[node_id].index(i)
+             assigned_physical_gpu_ids = sorted(node_physical_gpu_ids[node_id])
+             worker_env_vars: dict[str, str] = {}
++            for env_name in _ROCP_ATTACH_ENV_VARS:
++                if env_name in os.environ:
++                    worker_env_vars[env_name] = os.environ[env_name]
+             self.ray_worker_handles[i].local_rank = local_rank
+             init_worker_refs.append(
+                 self.ray_worker_handles[i].actor.initialize_worker.remote(
+@@ -564,6 +574,15 @@ class RayExecutorV2(MultiprocExecutor):
+ 
+         self._join_monitor_thread()
+ 
++        try:
++            # Let workers release profiler/model resources before we fall back
++            # to killing the Ray actors.
++            self.collective_rpc("shutdown")
++        except Exception:
++            logger.exception("Failed to shut down Ray workers gracefully")
++
++        threading.Event().wait(2.0)
++
+         for handle in getattr(self, "ray_worker_handles", []):
+             try:
+                 ray.kill(handle.actor)
+diff --git a/vllm/v1/worker/worker_base.py b/vllm/v1/worker/worker_base.py
+index cf5b0e7ce3..cf57d0c7f9 100644
+--- a/vllm/v1/worker/worker_base.py
++++ b/vllm/v1/worker/worker_base.py
+@@ -242,6 +242,7 @@ class WorkerWrapperBase:
+     def shutdown(self) -> None:
+         if self.worker is not None:
+             self.worker.shutdown()
++        raise SystemExit()
+ 
+     def update_environment_variables(
+         self,
