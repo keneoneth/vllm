@@ -227,7 +227,6 @@ def select_unquantized_moe_backend(
 
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = _get_priority_backends(moe_config)
-
     # NOTE(rob): We need to peak into the P/F selection to determine
     # if we are using the batched or standard expert format, which
     # if not ideal. Once we unify TP + DP/EP, we can select P/F first.

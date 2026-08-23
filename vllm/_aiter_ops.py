@@ -72,6 +72,21 @@ def is_aiter_found_and_supported() -> bool:
     return False
 
 
+def is_aiter_moe_found_and_supported() -> bool:
+    """Return whether AITER fused MoE may be used on this platform.
+
+    This is intentionally narrower than the global AITER gate. Enabling the
+    global gate on gfx12 also enables unrelated AITER paths such as sampling,
+    which are not validated on gfx1201. For MoE experiments, allow gfx12 only
+    through this feature-specific gate.
+    """
+    if current_platform.is_rocm() and IS_AITER_FOUND:
+        from vllm.platforms.rocm import on_gfx12x, on_mi3xx
+
+        return on_mi3xx() or on_gfx12x()
+    return False
+
+
 @functools.cache
 def _load_gemm_tuned_configs(
     q_dtype_w: torch.dtype, csv_path: str
@@ -144,6 +159,8 @@ def _rocm_aiter_fused_moe_impl(
     if gate_mode and rocm_aiter_ops.fused_moe_supports_gate_mode():
         extra_kwargs["gate_mode"] = gate_mode
 
+    swiglu_limit_arg = None if swiglu_limit == 0.0 else swiglu_limit
+
     return fused_moe(
         hidden_states,
         w1,
@@ -165,7 +182,7 @@ def _rocm_aiter_fused_moe_impl(
         bias1=bias1,
         bias2=bias2,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        swiglu_limit=swiglu_limit,
+        swiglu_limit=swiglu_limit_arg,
         **extra_kwargs,
     )
 
@@ -1472,7 +1489,6 @@ class rocm_aiter_ops:
     _MOE_DISPATCH_POLICY: int | None = None
 
     @classmethod
-    @if_aiter_supported
     def get_moe_dispatch_policy(cls) -> int:
         """Cached MoE sorting dispatch policy."""
         if cls._MOE_DISPATCH_POLICY is None:
@@ -1610,12 +1626,14 @@ class rocm_aiter_ops:
         return cls.is_linear_enabled()
 
     @classmethod
-    @if_aiter_supported
     def is_fused_moe_enabled(cls) -> bool:
-        return cls._AITER_ENABLED and cls._FMOE_ENABLED
+        return (
+            is_aiter_moe_found_and_supported()
+            and cls._AITER_ENABLED
+            and cls._FMOE_ENABLED
+        )
 
     @classmethod
-    @if_aiter_supported
     def is_fusion_moe_shared_experts_enabled(cls) -> bool:
         return cls.is_fused_moe_enabled() and cls._MOE_SHARED_EXPERTS_ENABLED
 
@@ -1772,7 +1790,6 @@ class rocm_aiter_ops:
             return False
 
     @classmethod
-    @if_aiter_supported
     @functools.cache
     def fused_moe_supports_gate_mode(cls) -> bool:
         """Probe whether the installed aiter.fused_moe accepts `gate_mode`.
@@ -1780,6 +1797,8 @@ class rocm_aiter_ops:
         Added in https://github.com/ROCm/aiter/pull/3123 (>=0.1.14).
         Builds with older AITER must omit this argument.
         """
+        if not is_aiter_moe_found_and_supported():
+            return False
         import inspect
 
         from aiter.fused_moe import fused_moe
@@ -1787,9 +1806,10 @@ class rocm_aiter_ops:
         return "gate_mode" in inspect.signature(fused_moe).parameters
 
     @staticmethod
-    @if_aiter_supported
     def register_ops_once() -> None:
         global _OPS_REGISTERED
+        if not (is_aiter_found_and_supported() or is_aiter_moe_found_and_supported()):
+            return None
         if not _OPS_REGISTERED:
             # register all the custom ops here
             direct_register_custom_op(

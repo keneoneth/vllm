@@ -378,6 +378,8 @@ def rocm_aiter_fused_experts(
                 if activation_interleave
                 else GateMode.SEPARATED.value
             )
+        elif activation == MoEActivation.SILU:
+            gate_mode = GateMode.SEPARATED.value
 
         return rocm_aiter_ops.fused_moe(
             hidden_states,
