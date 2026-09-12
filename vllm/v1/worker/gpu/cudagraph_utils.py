@@ -495,15 +495,6 @@ class CudaGraphManager:
                         desc.cg_mode.name,
                         desc,
                     )
-                    # PHASE13B prewarm hook: surgical insertion only.
-                    if (
-                        os.environ.get("AITER_GFX1151_MQA_GRAPH_STABLE_PREWARM_KEYS_JSON", "").strip()
-                        or os.environ.get("AITER_GFX1151_MQA_GRAPH_STABLE_PREWARM_KEYS_JSON_PATH", "").strip()
-                    ):
-                        from aiter.ops.triton.attention.fp8_mqa_logits import (
-                            prewarm_fp8_mqa_graph_out_cache_from_env,
-                        )
-                        prewarm_fp8_mqa_graph_out_cache_from_env(self.device)
                     if (
                         desc.cg_mode == CUDAGraphMode.PIECEWISE
                         and not self.use_breakable_cg
@@ -523,15 +514,6 @@ class CudaGraphManager:
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
 
-                        # PHASE13B prewarm hook: surgical insertion only.
-                        if (
-                            os.environ.get("AITER_GFX1151_MQA_GRAPH_STABLE_PREWARM_KEYS_JSON", "").strip()
-                            or os.environ.get("AITER_GFX1151_MQA_GRAPH_STABLE_PREWARM_KEYS_JSON_PATH", "").strip()
-                        ):
-                            from aiter.ops.triton.attention.fp8_mqa_logits import (
-                                prewarm_fp8_mqa_graph_out_cache_from_env,
-                            )
-                            prewarm_fp8_mqa_graph_out_cache_from_env(self.device)
                         if self.pool is not None:
                             set_graph_pool_id(self.pool)
                         else:
