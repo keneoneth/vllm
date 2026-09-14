@@ -857,6 +857,8 @@ class SparseAttnIndexer(CustomOp):
         candidate_blocks: torch.Tensor | None = None,
         candidate_block_size: int = 0,
         candidate_write: bool = False,
+        semantic_uncompressed_max_model_len: int = 0,
+        semantic_compress_ratio: int = 1,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -875,6 +877,8 @@ class SparseAttnIndexer(CustomOp):
         self.candidate_blocks = candidate_blocks
         self.candidate_block_size = candidate_block_size
         self.candidate_write = candidate_write
+        self.semantic_uncompressed_max_model_len = semantic_uncompressed_max_model_len
+        self.semantic_compress_ratio = semantic_compress_ratio
         self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
@@ -1044,6 +1048,10 @@ class SparseAttnIndexer(CustomOp):
                 candidate_blocks=self.candidate_blocks,
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=self.candidate_write,
+                semantic_uncompressed_max_model_len=(
+                    self.semantic_uncompressed_max_model_len
+                ),
+                semantic_compress_ratio=self.semantic_compress_ratio,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path requires AITER or a supported "
