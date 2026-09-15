@@ -3223,8 +3223,16 @@ class rocm_aiter_ops:
     def is_triton_gemm_w8a8_tuned(n: int, k: int) -> bool:
         if not current_platform.is_rocm():
             return False
-        from vllm.platforms.rocm import on_gfx950, on_rdna4
+        from vllm.platforms.rocm import on_gfx1151, on_gfx950, on_rdna4
 
+        # Tuned per-(N,K) shapes from the gfx1151 DSV4 blockscale tuning pass.
+        gfx1151_tuned = {
+            (1536, 4096),
+            (512, 4096),
+            (4096, 1024),
+            (8192, 1024),
+            (4096, 256),
+        }
         gfx950_tuned = {
             (1024, 8192),
             (2112, 7168),
@@ -3255,6 +3263,8 @@ class rocm_aiter_ops:
             (32768, 512),
             (36864, 7168),
         }
+        if on_gfx1151():
+            return (n, k) in gfx1151_tuned
         if on_rdna4():
             return (n, k) in rdna4_tuned
         if on_gfx950():
