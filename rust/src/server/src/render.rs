@@ -13,6 +13,7 @@ use vllm_chat::{
     ParserSelection, RendererSelection, load_model_backends,
 };
 use vllm_text::TextRequestProcessor;
+use vllm_text::backend::hf::HfOverrides;
 
 use crate::{
     HttpListenerMode, TlsConfig,

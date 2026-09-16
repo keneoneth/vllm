@@ -41,6 +41,13 @@ ARG_KEY_END = "</arg_key>"
 ARG_VALUE_START = "<arg_value>"
 ARG_VALUE_END = "</arg_value>"
 
+# Special tokens that delimit conversation turns in a rendered GLM prompt.
+# Reasoning markers belonging to earlier turns must not be mistaken for the
+# state of the turn currently being generated.
+GLM_TURN_BOUNDARIES = frozenset(
+    ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
+)
+
 _ARG_RE = re.compile(
     r"<arg_key>(?P<key>.*?)</arg_key>\s*"
     r"<arg_value>(?P<value>.*?)</arg_value>",
@@ -166,6 +173,7 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
             ),
             **arg_tag_transitions,
         },
+        turn_boundary_tokens=GLM_TURN_BOUNDARIES,
         arg_converter=_glm47_arg_converter,
         stream_arg_deltas=True,
         tool_args_json=False,

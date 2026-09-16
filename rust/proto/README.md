@@ -2,12 +2,13 @@
 
 This directory is the canonical source for vLLM's gRPC schema.
 
-The schema is published to `buf.build/vllm-project/vllm`:
+See [context parallel deployment](../../docs/serving/context_parallel_deployment.md)
+for effective attention block-size metadata in Python and `Control.GetServerInfo`.
 
-- A daily workflow publishes the latest Git `main` schema to the `nightly` label.
-- The workflow can be run manually to retry nightly publication.
-- Tags matching `v*` update the Buf `main` label and publish the corresponding release label.
-- Buf commits and generated SDK versions are immutable and can be pinned by consumers.
+Schema updates are no longer published to the Buf Schema Registry. Rust consumers
+should use `vllm-proto` from crates.io; consumers in other languages can generate
+bindings from the `.proto` files in this directory. Buf still builds and lints
+the schemas on pull requests, including on forks.
 
 Repository setup requires a `BUF_TOKEN` GitHub Actions secret with permission to create and push the public Buf module. Register the Prost and Tonic generated SDKs for the `main` and `nightly` labels once so subsequent pushes generate them automatically.
 

@@ -1121,6 +1121,73 @@ fn frontend_args_json_ignores_engine_owned_max_model_len() {
 }
 
 #[test]
+fn hf_overrides_preserve_merge_patch_in_cli_and_python_bootstrap() {
+    let patch = r#"{"text_config":{"rope_parameters":{"factor":4}},"sliding_window":null}"#;
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--hf-overrides",
+        patch,
+    ])
+    .unwrap();
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args")
+    };
+    let expected: serde_json::Value = serde_json::from_str(patch).unwrap();
+    assert_eq!(
+        serde_json::to_value(&args.runtime.hf_overrides).unwrap(),
+        expected
+    );
+    let engine = args.to_managed_engine_config(1234);
+    let index = engine.python_args.iter().position(|arg| arg == "--hf-overrides").unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&engine.python_args[index + 1]).unwrap(),
+        expected
+    );
+    assert!(!engine.python_args.iter().any(|arg| arg == "--hf-config-path"));
+    let config = args.to_frontend_config("tcp://127.0.0.1:1234".to_string());
+    assert_eq!(serde_json::to_value(config.hf_overrides).unwrap(), expected);
+
+    let payload = serde_json::json!({"model_tag":"Qwen/Qwen3-0.6B", "hf_overrides":expected});
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-address",
+        "ipc:///tmp/input.sock",
+        "--output-address",
+        "ipc:///tmp/output.sock",
+        "--args-json",
+        &payload.to_string(),
+    ])
+    .unwrap();
+    let Command::Frontend(args) = cli.command else {
+        panic!("expected frontend args")
+    };
+    assert_eq!(
+        serde_json::to_value(args.into_config().hf_overrides).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn hf_overrides_reject_non_object_inputs() {
+    for patch in ["null", "[]", "1", r#""callable""#] {
+        let error = Cli::try_parse_from([
+            "vllm-rs",
+            "serve",
+            "Qwen/Qwen3-0.6B",
+            "--hf-overrides",
+            patch,
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+}
+
+#[test]
 fn frontend_args_json_accepts_supported_non_default_fields() {
     let cli = Cli::try_parse_from([
         "vllm-rs",

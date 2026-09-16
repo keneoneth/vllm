@@ -378,6 +378,7 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
     class FakeDeepGemm:
         transformed_dims: list[tuple[int, int]] = []
         scale_inputs: list[tuple[int, ...]] = []
+        scale_values: list[torch.Tensor] = []
 
         @staticmethod
         def get_symm_buffer_for_mega_moe(*args, num_shared_experts=0, **kwargs):
@@ -402,6 +403,7 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
         @classmethod
         def transform_sf_into_required_layout(cls, sf, mn, k, *args, **kwargs):
             cls.scale_inputs.append(tuple(sf.shape))
+            cls.scale_values.append(sf)
             return torch.empty((sf.shape[0], mn, k // 128), dtype=torch.int32)
 
         @classmethod
@@ -429,7 +431,10 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
 
     def fp8_parameter(*shape):
         return torch.nn.Parameter(
-            torch.empty(*shape, dtype=torch.float8_e4m3fn), requires_grad=False
+            torch.empty(*shape, dtype=torch.uint8)
+            .random_(1, 119)
+            .view(torch.float8_e4m3fn),
+            requires_grad=False,
         )
 
     def scale_parameter(*shape, dtype=torch.int32):
@@ -499,6 +504,10 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
         experts._transformed_shared_l2_weights[0].data_ptr()
         == shared_experts.down_proj.weight.data_ptr()
     )
+
+    transformed_l1 = experts._transformed_shared_l1_weights
+    experts.finalize_weights(shared_experts)
+    assert experts._transformed_shared_l1_weights is transformed_l1
 
 
 @pytest.mark.parametrize("fused", [False, True])

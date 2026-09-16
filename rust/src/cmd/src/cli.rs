@@ -33,6 +33,7 @@ use vllm_server::{
     DEFAULT_KEEP_ALIVE_TIMEOUT, HttpListenerMode, LoraModulePath, ParserSelection, RenderConfig,
     RendererSelection,
 };
+use vllm_text::backend::hf::HfOverrides;
 
 use crate::cli::ssl::SslArgs;
 use crate::cli::unsupported::UnsupportedArgs;
@@ -761,6 +762,9 @@ impl ServeArgs {
         let reasoning_parser =
             effective_engine_reasoning_parser(&self.runtime.reasoning_parser, &self.runtime.model);
         let profiler_config = self.runtime.profiler_config_json();
+        let hf_overrides = (!self.runtime.hf_overrides.is_empty()).then(|| {
+            serde_json::to_string(&self.runtime.hf_overrides).expect("JSON object serializes")
+        });
 
         self.managed_engine.clone().into_config(
             self.runtime.model.clone(),
@@ -773,6 +777,7 @@ impl ServeArgs {
             self.runtime.shutdown_timeout,
             handshake_port,
             self.runtime.limit_mm_per_prompt_json(),
+            hf_overrides,
         )
     }
 }

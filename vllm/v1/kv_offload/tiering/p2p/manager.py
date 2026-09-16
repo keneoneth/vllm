@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-P2PSecondaryTierManager: Secondary tier for P2P KV cache sharing.
+"""P2PSecondaryTierManager: Secondary tier for P2P KV cache sharing.
 
 Owns transports and a single bidirectional P2PSession per remote peer.
 """

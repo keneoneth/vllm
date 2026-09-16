@@ -177,6 +177,7 @@ def _make_store_recving_thread(
     *,
     tp_rank: int = 0,
     disk_offload_buffer_budget_bytes: int | None = None,
+    is_hma_required: bool = False,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
@@ -199,6 +200,7 @@ def _make_store_recving_thread(
         ready_event=threading.Event(),
         coord=coord,
         disk_offload_buffer_budget_bytes=disk_offload_buffer_budget_bytes,
+        is_hma_required=is_hma_required,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -303,6 +305,7 @@ def _make_vllm_config(
     kv_role: str = "kv_both",
     pipeline_parallel_size: int = 1,
     kv_cache_layout: KVCacheLayout = KVCacheLayout.LBHNC,
+    disable_hybrid_kv_cache_manager: bool = True,
 ) -> SimpleNamespace:
     cache_config = SimpleNamespace(block_size=16, num_gpu_blocks=10)
     cache_config.get_resolved_kv_cache_layout = lambda: kv_cache_layout
@@ -319,6 +322,9 @@ def _make_vllm_config(
             kv_role=kv_role, extra_config=extra_config
         ),
         cache_config=cache_config,
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=disable_hybrid_kv_cache_manager
+        ),
         kv_events_config=SimpleNamespace(enable_kv_cache_events=False),
         speculative_config=None,
     )
@@ -3345,6 +3351,7 @@ def _make_bare_worker(
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
     worker._capacity_only = False
     worker.block_size = block_size
+    worker._is_hma_required = False
     worker.tp_rank = 0
     worker.enable_kv_events = False
     worker.load_async = True
@@ -4458,7 +4465,7 @@ def test_topology_standalone_store_with_disk_offload(tmp_path, monkeypatch):
 
 
 def test_topology_embedded_cpu_only(tmp_path, monkeypatch):
-    """embedded + CPU-only: no mode key (defaults to embedded),
+    """Embedded + CPU-only: no mode key (defaults to embedded),
     global_segment_size>0, enable_offload absent, no preferred_segment.
     This is the PR-40900 baseline recipe."""
     store = MagicMock()

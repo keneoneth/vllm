@@ -110,6 +110,7 @@ pub struct RequestMetrics {
     pub request_max_num_generation_tokens: HistogramFamily,
     pub request_params_max_tokens: HistogramFamily,
     pub request_params_n: HistogramFamily,
+    pub request_num_preemptions: HistogramFamily,
     pub request_prefill_kv_computed_tokens: HistogramFamily,
     pub time_to_first_token_seconds: HistogramFamily,
     pub inter_token_latency_seconds: HistogramFamily,
@@ -216,6 +217,14 @@ impl RequestMetrics {
             request_params_n.clone(),
         );
 
+        let request_num_preemptions =
+            Family::new_with_constructor(request_num_preemptions_histogram as fn() -> Histogram);
+        registry.register(
+            "vllm:request_num_preemptions",
+            "Histogram of the number of times a request was preempted.",
+            request_num_preemptions.clone(),
+        );
+
         let request_prefill_kv_computed_tokens =
             Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram);
         registry.register(
@@ -302,6 +311,7 @@ impl RequestMetrics {
             request_max_num_generation_tokens,
             request_params_max_tokens,
             request_params_n,
+            request_num_preemptions,
             request_prefill_kv_computed_tokens,
             time_to_first_token_seconds,
             inter_token_latency_seconds,

@@ -19,8 +19,7 @@ def mhc_pre_aiter(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Forward pass for mHC pre block.
+    """Forward pass for mHC pre block.
 
     Args:
         residual: shape (..., hc_mult, hidden_size), dtype torch.bfloat16
@@ -40,8 +39,8 @@ def mhc_pre_aiter(
         post_mix: shape (..., hc_mult), dtype torch.float32
         comb_mix: shape (..., hc_mult, hc_mult), dtype torch.float32
         layer_input: shape (..., hidden_size), dtype torch.bfloat16
-    """
 
+    """
     hidden_size = residual.shape[-1]
     assert hidden_size % 256 == 0
     from vllm._aiter_ops import rocm_aiter_ops
