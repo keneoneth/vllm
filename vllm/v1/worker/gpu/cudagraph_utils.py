@@ -180,6 +180,34 @@ def has_compiled_submodule(model: nn.Module) -> bool:
     )
 
 
+def allow_rocm_deepseek_v4_piecewise_without_compile(
+    vllm_config: VllmConfig,
+) -> bool:
+    """Allow the historical gfx1151 DeepSeek V4 piecewise path on ROCm.
+
+    The validated non-stage1 DSpark route on gfx1151 used
+    ``VLLM_USE_BREAKABLE_CUDAGRAPH=0`` and still reached successful PIECEWISE
+    capture on DeepSeek V4. Newer startup logic requires either breakable
+    cudagraphs or an active compiled submodule and otherwise downgrades
+    ``FULL_AND_PIECEWISE`` to ``FULL_DECODE_ONLY``. That regresses the known
+    working ROCm route.
+
+    Keep the bypass tightly scoped:
+    - ROCm only
+    - explicit launcher opt-in via ``VLLM_GFX1151_ALLOW_FP8_MQA_CUDAGRAPH=1``
+    - DeepSeek V4 main / MTP architectures only
+    """
+    if not current_platform.is_rocm():
+        return False
+
+    if os.environ.get("VLLM_GFX1151_ALLOW_FP8_MQA_CUDAGRAPH", "0") != "1":
+        return False
+
+    model_config = vllm_config.model_config
+    architectures = set(model_config.architectures if model_config else [])
+    return bool(architectures & {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"})
+
+
 class CudaGraphManager:
     def __init__(
         self,
@@ -655,7 +683,9 @@ class ModelCudaGraphManager(CudaGraphManager):
             self.init_breakable_cg_runner(model)
 
         if self.cudagraph_mode.has_piecewise_cudagraphs() and not (
-            self.use_breakable_cg or has_compiled_submodule(model)
+            self.use_breakable_cg
+            or has_compiled_submodule(model)
+            or allow_rocm_deepseek_v4_piecewise_without_compile(self.vllm_config)
         ):
             raise RuntimeError(
                 f"{type(model).__name__}: piecewise CUDA graphs "

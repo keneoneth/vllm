@@ -104,6 +104,7 @@ from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    allow_rocm_deepseek_v4_piecewise_without_compile,
     has_compiled_submodule,
     make_cudagraph_stats,
 )
@@ -695,7 +696,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             use_replayssm=self.cache_config.use_replayssm,
         )
         piecewise_capture_available = bool(
-            envs.VLLM_USE_BREAKABLE_CUDAGRAPH or has_compiled_submodule(self.model)
+            envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            or has_compiled_submodule(self.model)
+            or allow_rocm_deepseek_v4_piecewise_without_compile(self.vllm_config)
         )
         if self.adaptive_verification is not None:
             self.compilation_config.cudagraph_mode = resolve_adaptive_cudagraph_mode(
