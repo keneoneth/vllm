@@ -3581,9 +3581,23 @@ class rocm_aiter_ops:
         if not current_platform.is_rocm():
             return False
         try:
-            return _triton_gemm_config_is_tuned("GEMM-A8W8_BLOCKSCALE", n, k)
+            if _triton_gemm_config_is_tuned("GEMM-A8W8_BLOCKSCALE", n, k):
+                return True
         except (AssertionError, ImportError):
-            return False
+            pass
+        # gfx1151 tuned shapes validated offline; will be upstreamed into
+        # AITER's config registry.  Keep this fallback until the AITER PR
+        # lands so the tuned path is exercised on Strix Halo.
+        from vllm.platforms.rocm import on_gfx1151
+        if on_gfx1151() and (n, k) in {
+            (1536, 4096),
+            (512, 4096),
+            (4096, 1024),
+            (8192, 1024),
+            (4096, 256),
+        }:
+            return True
+        return False
 
     @staticmethod
     @functools.cache
