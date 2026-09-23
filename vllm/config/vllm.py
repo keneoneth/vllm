@@ -121,7 +121,15 @@ def default_breakable_cudagraph_architectures() -> frozenset[str]:
         # FULL_AND_PIECEWISE then dies at capture unless breakable CUDA
         # graphs are on. Enable this architecture so the published AMD
         # recipe can start.
-        return frozenset({"DeepseekV41ForCausalLM"})
+        return frozenset({
+            "DeepseekV41ForCausalLM",
+            # DeepseekV4 and its MTP draft model need breakable CUDA graphs
+            # on gfx1151 (Strix Halo) for the same reason as V4.1: the
+            # sparse SWA backend only supports UNIFORM_BATCH, so
+            # FULL_AND_PIECEWISE requires breakable CG to capture.
+            "DeepseekV4ForCausalLM",
+            "DeepSeekV4MTPModel",
+        })
     return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
 
 
