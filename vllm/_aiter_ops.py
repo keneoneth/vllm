@@ -3590,11 +3590,15 @@ class rocm_aiter_ops:
         # lands so the tuned path is exercised on Strix Halo.
         from vllm.platforms.rocm import on_gfx1151
         if on_gfx1151() and (n, k) in {
-            (1536, 4096),
             (512, 4096),
-            (4096, 1024),
-            (8192, 1024),
+            (1536, 4096),
+            (2048, 4096),
             (4096, 256),
+            (4096, 1024),
+            (4096, 4096),
+            (4096, 12288),
+            (8192, 1024),
+            (16384, 1024),
         }:
             return True
         return False
