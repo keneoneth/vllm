@@ -881,6 +881,8 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        self.semantic_uncompressed_max_model_len = semantic_uncompressed_max_model_len
+        self.semantic_compress_ratio = semantic_compress_ratio
         self.compress_ratio = compress_ratio
         # v4.1 two-level selection: the candidate source indexer writes the
         # top candidate blocks here; later indexers mask their scores with it.
