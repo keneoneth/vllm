@@ -1215,6 +1215,284 @@ torch::Tensor swmmacGEMM(const at::Tensor& in_a, const at::Tensor& in_b,
   return out_c;
 }
 
+template <int N>
+__global__ void fp8Dot4BlockscaleSkinnyGemmLargeK(
+    const int K, const int M, const int B_stride0,
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+    const float* __restrict__ As, const float* __restrict__ Bs,
+    __hip_bfloat16* __restrict__ C) {
+  const int lane = threadIdx.x & 31;
+  const int wave_id = threadIdx.x >> 5;
+  const int num_waves = blockDim.x >> 5;
+  const int col = blockIdx.x * num_waves + wave_id;
+  if (col >= M) return;
+
+  const int K4 = K / 4;
+  const int scale_k_groups = K / 128;
+  const int scale_m_group = col / 128;
+  float acc[N] = {0};
+  const int32_t* b_row = reinterpret_cast<const int32_t*>(B + col * B_stride0);
+
+  for (int sg = 0; sg < scale_k_groups; ++sg) {
+    const int k4_base = sg * 32;
+    const int32_t bv = (k4_base + lane < K4) ? b_row[k4_base + lane] : 0;
+    const float bs = Bs[scale_m_group * scale_k_groups + sg];
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      const int32_t* a_row = reinterpret_cast<const int32_t*>(A + n * K);
+      const int32_t av = (k4_base + lane < K4) ? a_row[k4_base + lane] : 0;
+      const float d = __builtin_amdgcn_dot4_f32_fp8_fp8(av, bv, 0.0f);
+      acc[n] += d * As[n * scale_k_groups + sg] * bs;
+    }
+  }
+
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+    for (int offset = 16; offset >= 1; offset >>= 1) {
+      acc[n] += __shfl_xor(acc[n], offset);
+    }
+  }
+
+  if (lane == 0) {
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      C[n * M + col] = static_cast<__hip_bfloat16>(acc[n]);
+    }
+  }
+}
+
+template <int N, int THREADS_PER_COLUMN>
+__global__ void fp8Dot4BlockscaleSkinnyGemmSmallK(
+    const int K, const int M, const int B_stride0,
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+    const float* __restrict__ As, const float* __restrict__ Bs,
+    __hip_bfloat16* __restrict__ C) {
+  const int tid = threadIdx.x;
+  const int col_in_block = tid / THREADS_PER_COLUMN;
+  const int lane_in_col = tid % THREADS_PER_COLUMN;
+  const int columns_per_block = blockDim.x / THREADS_PER_COLUMN;
+  const int col = blockIdx.x * columns_per_block + col_in_block;
+  if (col >= M) return;
+
+  const int K4 = K / 4;
+  const int k4_per_thread = K4 / THREADS_PER_COLUMN;
+  const int k4_begin = lane_in_col * k4_per_thread;
+  const int k4_end = k4_begin + k4_per_thread;
+  const int scale_k_groups = K / 128;
+  const int scale_m_group = col / 128;
+  float acc[N] = {0};
+  const int32_t* b_row = reinterpret_cast<const int32_t*>(B + col * B_stride0);
+
+  for (int k4 = k4_begin; k4 < k4_end; ++k4) {
+    const int32_t bv = b_row[k4];
+    const int scale_k_group = (k4 * 4) / 128;
+    const float bs = Bs[scale_m_group * scale_k_groups + scale_k_group];
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      const int32_t* a_row = reinterpret_cast<const int32_t*>(A + n * K);
+      const float d = __builtin_amdgcn_dot4_f32_fp8_fp8(a_row[k4], bv, 0.0f);
+      acc[n] += d * As[n * scale_k_groups + scale_k_group] * bs;
+    }
+  }
+
+  __shared__ float smem[256][8];
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+    smem[tid][n] = acc[n];
+  }
+  __syncthreads();
+
+  if (lane_in_col == 0) {
+    float sum[N] = {0};
+    for (int t = 0; t < THREADS_PER_COLUMN; ++t) {
+      const int idx = col_in_block * THREADS_PER_COLUMN + t;
+#pragma unroll
+      for (int n = 0; n < N; ++n) {
+        sum[n] += smem[idx][n];
+      }
+    }
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      C[n * M + col] = static_cast<__hip_bfloat16>(sum[n]);
+    }
+  }
+}
+
+template <int N, int WAVES_PER_BLOCK>
+__global__ void fp8Dot4BlockscaleSkinnyGemmSharedA(
+    const int K, const int M, const int B_stride0,
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+    const float* __restrict__ As, const float* __restrict__ Bs,
+    __hip_bfloat16* __restrict__ C) {
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave_id = tid >> 5;
+  const int col = blockIdx.x * WAVES_PER_BLOCK + wave_id;
+
+  __shared__ int32_t a_smem[8][32];
+  const int K4 = K / 4;
+  const int scale_k_groups = K / 128;
+  float acc[N] = {0};
+
+  for (int sg = 0; sg < scale_k_groups; ++sg) {
+    const int k4_base = sg * 32;
+    for (int idx = tid; idx < N * 32; idx += blockDim.x) {
+      const int n = idx / 32;
+      const int k4 = idx - n * 32;
+      const int32_t* a_row = reinterpret_cast<const int32_t*>(A + n * K);
+      a_smem[n][k4] = a_row[k4_base + k4];
+    }
+    __syncthreads();
+
+    if (col < M) {
+      const int32_t* b_row =
+          reinterpret_cast<const int32_t*>(B + col * B_stride0);
+      const int32_t bv = (k4_base + lane < K4) ? b_row[k4_base + lane] : 0;
+      const int scale_m_group = col / 128;
+      const float bs = Bs[scale_m_group * scale_k_groups + sg];
+#pragma unroll
+      for (int n = 0; n < N; ++n) {
+        const float d =
+            __builtin_amdgcn_dot4_f32_fp8_fp8(a_smem[n][lane], bv, 0.0f);
+        acc[n] += d * As[n * scale_k_groups + sg] * bs;
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+    for (int offset = 16; offset >= 1; offset >>= 1) {
+      acc[n] += __shfl_xor(acc[n], offset);
+    }
+  }
+
+  if (col < M && lane == 0) {
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      C[n * M + col] = static_cast<__hip_bfloat16>(acc[n]);
+    }
+  }
+}
+
+torch::Tensor fp8Dot4BlockscaleSkinnyGEMM(const at::Tensor& in_a,
+                                          const at::Tensor& in_b,
+                                          const at::Tensor& scale_a,
+                                          const at::Tensor& scale_b) {
+  TORCH_CHECK(on_gfx120x(),
+              "fp8Dot4BlockscaleSkinnyGEMM is only supported on GFX120x");
+  TORCH_CHECK(in_a.dim() == 2, "A must be a 2D tensor");
+  TORCH_CHECK(in_b.dim() == 2, "B must be a 2D tensor");
+  TORCH_CHECK(scale_a.dim() == 2, "scale_a must be a 2D tensor");
+  TORCH_CHECK(scale_b.dim() == 2, "scale_b must be a 2D tensor");
+
+  const int N = static_cast<int>(in_a.size(0));
+  const int K = static_cast<int>(in_a.size(1));
+  const int M = static_cast<int>(in_b.size(0));
+  const int B_stride0 = static_cast<int>(in_b.stride(0));
+  const int B_stride1 = static_cast<int>(in_b.stride(1));
+  constexpr int block_shape = 128;
+
+  TORCH_CHECK(N >= 5 && N <= 8,
+              "fp8Dot4BlockscaleSkinnyGEMM supports N in [5, 8]");
+  TORCH_CHECK(in_b.size(1) == K, "A and B inner dimensions (K) must match");
+  TORCH_CHECK(K % block_shape == 0, "K must be divisible by 128");
+  TORCH_CHECK(B_stride1 == 1, "B must be contiguous in the K dimension");
+  TORCH_CHECK(scale_a.size(0) == N && scale_a.size(1) == K / block_shape,
+              "scale_a must have shape [N, K / 128]");
+  TORCH_CHECK(scale_b.size(0) == (M + block_shape - 1) / block_shape &&
+                  scale_b.size(1) == K / block_shape,
+              "scale_b must have shape [ceil(M / 128), K / 128]");
+
+  auto out = torch::empty(
+      {N, M},
+      torch::TensorOptions().dtype(torch::kBFloat16).device(in_a.device()));
+
+  const auto* A = reinterpret_cast<const uint8_t*>(in_a.data_ptr());
+  const auto* B = reinterpret_cast<const uint8_t*>(in_b.data_ptr());
+  const auto* As = scale_a.data_ptr<float>();
+  const auto* Bs = scale_b.data_ptr<float>();
+  auto* C = reinterpret_cast<__hip_bfloat16*>(out.data_ptr());
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  if (M == 1280 && K == 8192) {
+    constexpr int waves_per_block = 8;
+    constexpr int threads = waves_per_block * 32;
+    const int blocks = (M + waves_per_block - 1) / waves_per_block;
+#define VLLM_LAUNCH_FP8_DOT4_SHAREDA(_N)                  \
+  fp8Dot4BlockscaleSkinnyGemmSharedA<_N, waves_per_block> \
+      <<<blocks, threads, 0, stream>>>(K, M, B_stride0, A, B, As, Bs, C)
+    switch (N) {
+      case 5:
+        VLLM_LAUNCH_FP8_DOT4_SHAREDA(5);
+        break;
+      case 6:
+        VLLM_LAUNCH_FP8_DOT4_SHAREDA(6);
+        break;
+      case 7:
+        VLLM_LAUNCH_FP8_DOT4_SHAREDA(7);
+        break;
+      case 8:
+        VLLM_LAUNCH_FP8_DOT4_SHAREDA(8);
+        break;
+    }
+#undef VLLM_LAUNCH_FP8_DOT4_SHAREDA
+    return out;
+  }
+
+  if (K <= 1024) {
+    constexpr int threads_per_column = 8;
+    constexpr int threads = 128;
+    constexpr int columns_per_block = threads / threads_per_column;
+    const int blocks = (M + columns_per_block - 1) / columns_per_block;
+#define VLLM_LAUNCH_FP8_DOT4_SMALL(_N)                      \
+  fp8Dot4BlockscaleSkinnyGemmSmallK<_N, threads_per_column> \
+      <<<blocks, threads, 0, stream>>>(K, M, B_stride0, A, B, As, Bs, C)
+    switch (N) {
+      case 5:
+        VLLM_LAUNCH_FP8_DOT4_SMALL(5);
+        break;
+      case 6:
+        VLLM_LAUNCH_FP8_DOT4_SMALL(6);
+        break;
+      case 7:
+        VLLM_LAUNCH_FP8_DOT4_SMALL(7);
+        break;
+      case 8:
+        VLLM_LAUNCH_FP8_DOT4_SMALL(8);
+        break;
+    }
+#undef VLLM_LAUNCH_FP8_DOT4_SMALL
+  } else {
+    constexpr int waves_per_block = 4;
+    constexpr int threads_per_wave = 32;
+    constexpr int threads = waves_per_block * threads_per_wave;
+    const int blocks = (M + waves_per_block - 1) / waves_per_block;
+#define VLLM_LAUNCH_FP8_DOT4_LARGE(_N)  \
+  fp8Dot4BlockscaleSkinnyGemmLargeK<_N> \
+      <<<blocks, threads, 0, stream>>>(K, M, B_stride0, A, B, As, Bs, C)
+    switch (N) {
+      case 5:
+        VLLM_LAUNCH_FP8_DOT4_LARGE(5);
+        break;
+      case 6:
+        VLLM_LAUNCH_FP8_DOT4_LARGE(6);
+        break;
+      case 7:
+        VLLM_LAUNCH_FP8_DOT4_LARGE(7);
+        break;
+      case 8:
+        VLLM_LAUNCH_FP8_DOT4_LARGE(8);
+        break;
+    }
+#undef VLLM_LAUNCH_FP8_DOT4_LARGE
+  }
+
+  return out;
+}
+
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,

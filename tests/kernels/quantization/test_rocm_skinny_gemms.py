@@ -223,6 +223,18 @@ NKM_FACTORS_WVSPLITK_FP8 = [
     (4, 32768 * 2 + 16, 28672 + 16),
 ]
 
+NKM_FACTORS_FP8_DOT4_BLOCKSCALE = [
+    # Llama-3.3-70B-FP8-block fused QKV and down-projection shapes.
+    (5, 8192, 1280),
+    (6, 8192, 1280),
+    (7, 8192, 1280),
+    (8, 8192, 1280),
+    (5, 3584, 8192),
+    (6, 3584, 8192),
+    (7, 3584, 8192),
+    (8, 3584, 8192),
+]
+
 
 @pytest.fixture(scope="module", autouse=True)
 def cleanup_after_all_tests():
@@ -449,6 +461,39 @@ def test_rocm_swmmac_gemm_kernel(n, k, m, dtype, bias_mode, seed):
     ref_out = torch.nn.functional.linear(A, B, BIAS)
     out = ops.swmmac_gemm(A.view(-1, A.size(-1)), B, B.shape[0], cu_count, BIAS)
 
+    torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("n,k,m", NKM_FACTORS_FP8_DOT4_BLOCKSCALE)
+@pytest.mark.parametrize("padded_b", [False, True])
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm() and on_gfx12x() and current_platform.supports_fp8()
+    ),
+    reason="only supported on gfx12 with fp8",
+)
+@torch.inference_mode()
+def test_rocm_fp8_dot4_blockscale_skinny_gemm(n, k, m, padded_b, seed):
+    torch.manual_seed(seed)
+    xavier = math.sqrt(2 / k)
+    A = ((torch.rand(n, k, device="cuda") * 2 - 1) * xavier).to(torch.float8_e4m3fn)
+
+    B_storage = (
+        (torch.rand(m, k + (256 if padded_b else 0), device="cuda") * 2 - 1) * xavier
+    ).to(torch.float8_e4m3fn)
+    B = B_storage[:, :k] if padded_b else B_storage
+
+    As = torch.ones(n, k // 128, dtype=torch.float32, device="cuda")
+    Bs = torch.ones((m + 127) // 128, k // 128, dtype=torch.float32, device="cuda")
+
+    ref_out = (A.float() @ B.float().t()).to(torch.bfloat16)
+    out = ops.fp8_dot4_blockscale_skinny_gemm(A, B, As, Bs)
+
+    cos = torch.nn.functional.cosine_similarity(
+        ref_out.flatten().float(), out.flatten().float(), dim=0
+    )
+    assert cos.item() > 0.999
     torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=2e-2)
 
 

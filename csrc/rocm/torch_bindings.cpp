@@ -80,6 +80,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? in_bias, int logical_M, int CuCount) -> Tensor");
   rocm_ops.impl("swmmacGEMM", torch::kCUDA, &swmmacGEMM);
 
+  rocm_ops.def(
+      "fp8Dot4BlockscaleSkinnyGEMM(Tensor in_a, Tensor in_b, "
+      "Tensor scale_a, Tensor scale_b) -> Tensor");
+  rocm_ops.impl("fp8Dot4BlockscaleSkinnyGEMM", torch::kCUDA,
+                &fp8Dot4BlockscaleSkinnyGEMM);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

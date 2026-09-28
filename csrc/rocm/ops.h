@@ -23,6 +23,11 @@ torch::Tensor swmmacGEMM(const at::Tensor& in_a, const at::Tensor& in_b,
                          const std::optional<at::Tensor>& in_bias,
                          const int64_t logical_M, const int64_t CuCount);
 
+torch::Tensor fp8Dot4BlockscaleSkinnyGEMM(const at::Tensor& in_a,
+                                          const at::Tensor& in_b,
+                                          const at::Tensor& scale_a,
+                                          const at::Tensor& scale_b);
+
 void wvSplitKQ(const at::Tensor& in_a, const at::Tensor& in_b,
                const std::optional<at::Tensor>& in_bias, at::Tensor& out_c,
                const at::Tensor& scale_a, const at::Tensor& scale_b,
