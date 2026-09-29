@@ -1375,6 +1375,75 @@ __global__ void fp8Dot4BlockscaleSkinnyGemmSharedA(
   }
 }
 
+template <int N, int COLS_PER_WAVE>
+__global__ void fp8Dot4BlockscaleSkinnyGemmMultiColLargeK(
+    const int K, const int M, const int B_stride0,
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+    const float* __restrict__ As, const float* __restrict__ Bs,
+    __hip_bfloat16* __restrict__ C) {
+  const int lane = threadIdx.x & 31;
+  const int wave_id = threadIdx.x >> 5;
+  const int waves_per_block = blockDim.x >> 5;
+  const int col_base = (blockIdx.x * waves_per_block + wave_id) * COLS_PER_WAVE;
+
+  const int K4 = K / 4;
+  const int scale_k_groups = K / 128;
+  float acc[COLS_PER_WAVE][N] = {};
+
+  for (int sg = 0; sg < scale_k_groups; ++sg) {
+    const int k4_base = sg * 32;
+    int32_t b_vals[COLS_PER_WAVE] = {};
+    float b_scales[COLS_PER_WAVE] = {};
+
+#pragma unroll
+    for (int c = 0; c < COLS_PER_WAVE; ++c) {
+      const int col = col_base + c;
+      if (col < M) {
+        const int32_t* b_row =
+            reinterpret_cast<const int32_t*>(B + col * B_stride0);
+        b_vals[c] = (k4_base + lane < K4) ? b_row[k4_base + lane] : 0;
+        b_scales[c] = Bs[(col / 128) * scale_k_groups + sg];
+      }
+    }
+
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      const int32_t* a_row = reinterpret_cast<const int32_t*>(A + n * K);
+      const int32_t a_val = (k4_base + lane < K4) ? a_row[k4_base + lane] : 0;
+      const float a_scale = As[n * scale_k_groups + sg];
+#pragma unroll
+      for (int c = 0; c < COLS_PER_WAVE; ++c) {
+        const float d =
+            __builtin_amdgcn_dot4_f32_fp8_fp8(a_val, b_vals[c], 0.0f);
+        acc[c][n] += d * a_scale * b_scales[c];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < COLS_PER_WAVE; ++c) {
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      for (int offset = 16; offset >= 1; offset >>= 1) {
+        acc[c][n] += __shfl_xor(acc[c][n], offset);
+      }
+    }
+  }
+
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < COLS_PER_WAVE; ++c) {
+      const int col = col_base + c;
+      if (col < M) {
+#pragma unroll
+        for (int n = 0; n < N; ++n) {
+          C[n * M + col] = static_cast<__hip_bfloat16>(acc[c][n]);
+        }
+      }
+    }
+  }
+}
+
 torch::Tensor fp8Dot4BlockscaleSkinnyGEMM(const at::Tensor& in_a,
                                           const at::Tensor& in_b,
                                           const at::Tensor& scale_a,
@@ -1439,6 +1508,33 @@ torch::Tensor fp8Dot4BlockscaleSkinnyGEMM(const at::Tensor& in_a,
         break;
     }
 #undef VLLM_LAUNCH_FP8_DOT4_SHAREDA
+    return out;
+  }
+
+  if (M == 8192 && K == 3584) {
+    constexpr int cols_per_wave = 4;
+    constexpr int waves_per_block = 4;
+    constexpr int threads = waves_per_block * 32;
+    const int work_items = (M + cols_per_wave - 1) / cols_per_wave;
+    const int blocks = (work_items + waves_per_block - 1) / waves_per_block;
+#define VLLM_LAUNCH_FP8_DOT4_MULTICOL(_N)                      \
+  fp8Dot4BlockscaleSkinnyGemmMultiColLargeK<_N, cols_per_wave> \
+      <<<blocks, threads, 0, stream>>>(K, M, B_stride0, A, B, As, Bs, C)
+    switch (N) {
+      case 5:
+        VLLM_LAUNCH_FP8_DOT4_MULTICOL(5);
+        break;
+      case 6:
+        VLLM_LAUNCH_FP8_DOT4_MULTICOL(6);
+        break;
+      case 7:
+        VLLM_LAUNCH_FP8_DOT4_MULTICOL(7);
+        break;
+      case 8:
+        VLLM_LAUNCH_FP8_DOT4_MULTICOL(8);
+        break;
+    }
+#undef VLLM_LAUNCH_FP8_DOT4_MULTICOL
     return out;
   }
 
