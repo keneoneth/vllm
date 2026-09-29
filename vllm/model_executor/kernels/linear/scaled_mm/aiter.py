@@ -39,6 +39,7 @@ _FP8_DOT4_SKINNY_SHAPES = {
     (1280, 8192),  # Llama-3.3-70B-FP8-block fused QKV
     (8192, 3584),  # Llama-3.3-70B-FP8-block down projection
 }
+_FP8_DOT4_SKINNY_GATE_UP_SHAPE = (7168, 8192)
 
 
 class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
@@ -482,7 +483,13 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             if (
                 5 <= n_tokens <= 8
                 and out_dtype == torch.bfloat16
-                and weight_shape in _FP8_DOT4_SKINNY_SHAPES
+                and (
+                    weight_shape in _FP8_DOT4_SKINNY_SHAPES
+                    or (
+                        n_tokens == 5
+                        and weight_shape == _FP8_DOT4_SKINNY_GATE_UP_SHAPE
+                    )
+                )
                 and A.size(1) % 128 == 0
                 and B.stride(1) == 1
                 and Bs.dim() == 2

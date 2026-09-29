@@ -1573,6 +1573,17 @@ torch::Tensor fp8Dot4BlockscaleSkinnyGEMM(const at::Tensor& in_a,
     return out;
   }
 
+  if (N == 5 && M == 7168 && K == 8192) {
+    constexpr int cols_per_wave = 2;
+    constexpr int waves_per_block = 4;
+    constexpr int threads = waves_per_block * 32;
+    const int work_items = (M + cols_per_wave - 1) / cols_per_wave;
+    const int blocks = (work_items + waves_per_block - 1) / waves_per_block;
+    fp8Dot4BlockscaleSkinnyGemmMultiColLargeK<5, cols_per_wave>
+        <<<blocks, threads, 0, stream>>>(K, M, B_stride0, A, B, As, Bs, C);
+    return out;
+  }
+
   if (M == 8192 && K == 3584) {
     constexpr int cols_per_wave = 4;
     constexpr int waves_per_block = 4;
