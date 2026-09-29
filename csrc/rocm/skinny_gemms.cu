@@ -1444,6 +1444,67 @@ __global__ void fp8Dot4BlockscaleSkinnyGemmMultiColLargeK(
   }
 }
 
+template <int N, int WAVES_PER_COL, int COLS_PER_BLOCK>
+__global__ void fp8Dot4BlockscaleSkinnyGemmSplitKLargeK(
+    const int K, const int M, const int B_stride0,
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+    const float* __restrict__ As, const float* __restrict__ Bs,
+    __hip_bfloat16* __restrict__ C) {
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave_id = tid >> 5;
+  const int col_in_block = wave_id / WAVES_PER_COL;
+  const int k_part = wave_id - col_in_block * WAVES_PER_COL;
+  const int col = blockIdx.x * COLS_PER_BLOCK + col_in_block;
+
+  __shared__ float partial[COLS_PER_BLOCK][WAVES_PER_COL][8];
+
+  const int scale_k_groups = K / 128;
+  float acc[N] = {};
+
+  if (col < M) {
+    const int32_t* b_row =
+        reinterpret_cast<const int32_t*>(B + col * B_stride0);
+    const int scale_m_group = col / 128;
+    for (int sg = k_part; sg < scale_k_groups; sg += WAVES_PER_COL) {
+      const int k4 = sg * 32 + lane;
+      const int32_t b_val = b_row[k4];
+      const float b_scale = Bs[scale_m_group * scale_k_groups + sg];
+#pragma unroll
+      for (int n = 0; n < N; ++n) {
+        const int32_t* a_row = reinterpret_cast<const int32_t*>(A + n * K);
+        const int32_t a_val = a_row[k4];
+        const float d = __builtin_amdgcn_dot4_f32_fp8_fp8(a_val, b_val, 0.0f);
+        acc[n] += d * As[n * scale_k_groups + sg] * b_scale;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+    for (int offset = 16; offset >= 1; offset >>= 1) {
+      acc[n] += __shfl_xor(acc[n], offset);
+    }
+  }
+
+  if (lane == 0) {
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+      partial[col_in_block][k_part][n] = acc[n];
+    }
+  }
+  __syncthreads();
+
+  if (col < M && k_part == 0 && lane < N) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int p = 0; p < WAVES_PER_COL; ++p) {
+      sum += partial[col_in_block][p][lane];
+    }
+    C[lane * M + col] = static_cast<__hip_bfloat16>(sum);
+  }
+}
+
 torch::Tensor fp8Dot4BlockscaleSkinnyGEMM(const at::Tensor& in_a,
                                           const at::Tensor& in_b,
                                           const at::Tensor& scale_a,
@@ -1487,27 +1548,28 @@ torch::Tensor fp8Dot4BlockscaleSkinnyGEMM(const at::Tensor& in_a,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (M == 1280 && K == 8192) {
-    constexpr int waves_per_block = 8;
-    constexpr int threads = waves_per_block * 32;
-    const int blocks = (M + waves_per_block - 1) / waves_per_block;
-#define VLLM_LAUNCH_FP8_DOT4_SHAREDA(_N)                  \
-  fp8Dot4BlockscaleSkinnyGemmSharedA<_N, waves_per_block> \
+    constexpr int waves_per_col = 2;
+    constexpr int cols_per_block = 4;
+    constexpr int threads = waves_per_col * cols_per_block * 32;
+    const int blocks = (M + cols_per_block - 1) / cols_per_block;
+#define VLLM_LAUNCH_FP8_DOT4_SPLITK(_N)                                      \
+  fp8Dot4BlockscaleSkinnyGemmSplitKLargeK<_N, waves_per_col, cols_per_block> \
       <<<blocks, threads, 0, stream>>>(K, M, B_stride0, A, B, As, Bs, C)
     switch (N) {
       case 5:
-        VLLM_LAUNCH_FP8_DOT4_SHAREDA(5);
+        VLLM_LAUNCH_FP8_DOT4_SPLITK(5);
         break;
       case 6:
-        VLLM_LAUNCH_FP8_DOT4_SHAREDA(6);
+        VLLM_LAUNCH_FP8_DOT4_SPLITK(6);
         break;
       case 7:
-        VLLM_LAUNCH_FP8_DOT4_SHAREDA(7);
+        VLLM_LAUNCH_FP8_DOT4_SPLITK(7);
         break;
       case 8:
-        VLLM_LAUNCH_FP8_DOT4_SHAREDA(8);
+        VLLM_LAUNCH_FP8_DOT4_SPLITK(8);
         break;
     }
-#undef VLLM_LAUNCH_FP8_DOT4_SHAREDA
+#undef VLLM_LAUNCH_FP8_DOT4_SPLITK
     return out;
   }
 
@@ -2237,7 +2299,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       if (m >= M) continue;
   #endif
 
-      // Fetch the weight matrix from memory!
+        // Fetch the weight matrix from memory!
   #pragma unroll
       for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
