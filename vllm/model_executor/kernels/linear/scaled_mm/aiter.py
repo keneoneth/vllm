@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 
@@ -32,6 +33,13 @@ from .ScaledMMLinearKernel import (
 )
 
 logger = init_logger(__name__)
+
+_FP8_DOT4_SKINNY_ENABLED = os.environ.get("VLLM_ROCM_USE_FP8_DOT4_SKINNY", "0") == "1"
+_FP8_DOT4_SKINNY_SHAPES = {
+    (1280, 8192),  # Llama-3.3-70B-FP8-block fused QKV
+    (8192, 3584),  # Llama-3.3-70B-FP8-block down projection
+}
+_FP8_DOT4_SKINNY_GATE_UP_SHAPE = (7168, 8192)
 
 
 class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
@@ -468,6 +476,32 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
         else:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.gemm_a8w8_blockscale
+
+        if _FP8_DOT4_SKINNY_ENABLED:
+            n_tokens = A.size(0)
+            weight_shape = (B.size(0), A.size(1))
+            if (
+                5 <= n_tokens <= 8
+                and out_dtype == torch.bfloat16
+                and (
+                    weight_shape in _FP8_DOT4_SKINNY_SHAPES
+                    or (
+                        n_tokens == 5
+                        and weight_shape == _FP8_DOT4_SKINNY_GATE_UP_SHAPE
+                    )
+                )
+                and A.size(1) % 128 == 0
+                and B.stride(1) == 1
+                and Bs.dim() == 2
+                and Bs.size(0) == (B.size(0) + 127) // 128
+                and Bs.size(1) == A.size(1) // 128
+            ):
+                return ops.fp8_dot4_blockscale_skinny_gemm(
+                    A,
+                    B,
+                    As.to(torch.float32).contiguous(),
+                    Bs.to(torch.float32).contiguous(),
+                )
 
         return gemm_a8w8_blockscale_op(
             A, B, As, Bs, list(self.weight_group_shape), output_dtype=out_dtype

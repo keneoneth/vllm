@@ -2166,6 +2166,20 @@ def swmmac_gemm(
     )
 
 
+def fp8_dot4_blockscale_skinny_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.fp8Dot4BlockscaleSkinnyGEMM(
+        a.view(torch.uint8),
+        b.view(torch.uint8),
+        scale_a,
+        scale_b,
+    )
+
+
 # moe
 def moe_sum(
     input: torch.Tensor,
