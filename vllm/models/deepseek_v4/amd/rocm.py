@@ -671,9 +671,22 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         vllm_config = args[0] if args else kwargs["vllm_config"]
         super().__init__(*args, **kwargs)
         self._has_kv_transfer = vllm_config.kv_transfer_config is not None
-        # Block scale for the preshuffled weight; None = not preshuffled.
+        # gfx1151 keeps one plain weight for skinny and the linear fallback.
         self._wqa_wkv_scale: torch.Tensor | None = None
         self._wo_b_scale: torch.Tensor | None = None
+        self._wqa_wkv_skinny_scale: torch.Tensor | None = None
+        self._wo_b_skinny_scale: torch.Tensor | None = None
+        self._wvsplitk_cu_count: int | None = None
+
+        from vllm.platforms.rocm import on_gfx1151
+
+        if on_gfx1151():
+            # The current AITER blockscale backend is already plain. Mark the
+            # direct consumers before post-load processing for relayout-aware
+            # backends, and separately skip the model-owned shuffle below.
+            self.fused_wqa_wkv.skip_weight_relayout = True
+            self.wo_b.skip_weight_relayout = True
+
         self._wo_a_fp8_weight: torch.Tensor | None = None
         self._wo_a_e8m0_scale: torch.Tensor | None = None
         self._wo_a_cos_cache: torch.Tensor | None = None
@@ -895,13 +908,61 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
     def prepare_attn_preshuffle(self) -> None:
         from vllm._aiter_ops import rocm_aiter_ops
-
-        if not rocm_aiter_ops.is_enabled():
-            return
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
             get_fp8_block_weight_scale,
         )
+        from vllm.platforms.rocm import on_gfx1151
+
+        if on_gfx1151():
+            # Do not model-preshuffle either direct consumer, even when skinny
+            # is unavailable. The normal linear fallback owns its weight layout.
+            if not rocm_aiter_ops.is_rdna_linear_enabled():
+                return
+
+            from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
+                AiterFp8BlockScaledMMKernel,
+            )
+
+            def _plain_scale(linear) -> torch.Tensor | None:
+                method = getattr(linear, "quant_method", None)
+                scheme = getattr(linear, "scheme", method)
+                kernel = getattr(scheme, "fp8_linear", None)
+                # Contiguity alone cannot distinguish a shuffled payload.
+                # Only enable skinny for the audited plain-weight backend.
+                if type(kernel) is not AiterFp8BlockScaledMMKernel:
+                    return None
+                w = getattr(linear, "weight", None)
+                if (
+                    w is None
+                    or w.dtype != torch.float8_e4m3fn
+                    or w.dim() != 2
+                    or not w.is_contiguous()
+                ):
+                    return None
+                ws = get_fp8_block_weight_scale(linear)
+                if ws is None or ws.dim() != 2:
+                    return None
+                if ws.dtype == torch.float8_e8m0fnu:
+                    ws = _upcast_e8m0_to_fp32(ws)
+                if ws.dtype != torch.float32:
+                    return None
+                return ws.contiguous()
+
+            self._wqa_wkv_skinny_scale = _plain_scale(self.fused_wqa_wkv)
+            self._wo_b_skinny_scale = _plain_scale(self.wo_b)
+            if (
+                self._wqa_wkv_skinny_scale is not None
+                or self._wo_b_skinny_scale is not None
+            ):
+                device = self.fused_wqa_wkv.weight.device
+                self._wvsplitk_cu_count = torch.cuda.get_device_properties(
+                    device
+                ).multi_processor_count
+            return
+
+        if not rocm_aiter_ops.is_enabled():
+            return
         from vllm.model_executor.utils import replace_parameter
 
         def _prep(linear) -> torch.Tensor | None:
@@ -1054,6 +1115,53 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         self._fused_compressor_split_sizes = (main_size, indexer_size)
         return True
 
+    def _use_wvsplitk_blockscale(
+        self,
+        weight: torch.Tensor,
+        scale: torch.Tensor | None,
+        x: torch.Tensor,
+        expected_n: int,
+    ) -> bool:
+        return (
+            self._wvsplitk_cu_count is not None
+            and scale is not None
+            and x.dtype == torch.bfloat16
+            and x.dim() == 2
+            and 1 <= x.shape[0] <= 6
+            and x.shape[1] == 4096
+            and weight.dtype == torch.float8_e4m3fn
+            and weight.dim() == 2
+            and tuple(weight.shape) == (expected_n, 4096)
+            and weight.is_contiguous()
+            and tuple(scale.shape) == (expected_n // 128, 4096 // 128)
+            and scale.dtype == torch.float32
+            and scale.is_contiguous()
+        )
+
+    def _skinny_attn_gemm(
+        self,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        x: torch.Tensor,
+        reduce_tp: bool,
+    ) -> torch.Tensor:
+        import vllm._custom_ops as ops
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        # Ordinary blockscale uses row-major activation scales.
+        x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=False)
+        assert self._wvsplitk_cu_count is not None
+        out = ops.wvSplitKQBlockScale(
+            weight,
+            x_fp8.contiguous(),
+            x_scale.contiguous(),
+            scale,
+            self._wvsplitk_cu_count,
+        )
+        if reduce_tp and get_tensor_model_parallel_world_size() > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out
+
     def _bpre_attn_gemm(
         self,
         weight: torch.Tensor,
@@ -1072,10 +1180,25 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         return out
 
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_wvsplitk_blockscale(
+            self.fused_wqa_wkv.weight,
+            self._wqa_wkv_skinny_scale,
+            hidden_states,
+            1536,
+        ):
+            assert self._wqa_wkv_skinny_scale is not None
+            return self._skinny_attn_gemm(
+                self.fused_wqa_wkv.weight,
+                self._wqa_wkv_skinny_scale,
+                hidden_states,
+                False,
+            )
+
         if self._wqa_wkv_scale is not None and hidden_states.dim() == 2:
             return self._bpre_attn_gemm(
                 self.fused_wqa_wkv.weight, self._wqa_wkv_scale, hidden_states, False
             )
+        # The audited AITER blockscale backend consumes the same plain weight.
         return super()._fused_wqa_wkv_gemm(hidden_states)
 
     def _run_parallel_input_projections(
@@ -1210,8 +1333,16 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 inverse_rope=False,
             )
             zf = z.flatten(1)
+        if self._use_wvsplitk_blockscale(
+            self.wo_b.weight, self._wo_b_skinny_scale, zf, 4096
+        ):
+            assert self._wo_b_skinny_scale is not None
+            return self._skinny_attn_gemm(
+                self.wo_b.weight, self._wo_b_skinny_scale, zf, True
+            )
         if self._wo_b_scale is not None and zf.dim() == 2:
             return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
+        # RowParallelLinear keeps its normal TP reduction semantics here.
         return self.wo_b(zf)
 
     def forward_mqa(

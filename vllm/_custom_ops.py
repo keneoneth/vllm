@@ -2150,6 +2150,32 @@ def wvSplitKQ(
     return out
 
 
+def wvSplitKQBlockScale(
+    weight: torch.Tensor,
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    cu_count: int,
+) -> torch.Tensor:
+    """gfx1151 W8A8 skinny GEMM over the normal blockscale layout.
+
+    Contract:
+      weight:           contiguous FP8 [N,K], never AITER bpreshuffled
+      activation:       contiguous FP8 [M,K]
+      activation_scale: contiguous FP32 [M,K/128]
+      weight_scale:     contiguous FP32 [N/128,K/128]
+    """
+    out = torch.empty(
+        (activation.shape[0], weight.shape[0]),
+        dtype=torch.bfloat16,
+        device=activation.device,
+    )
+    torch.ops._rocm_C.wvSplitKQBlockScale(
+        weight, activation, activation_scale, weight_scale, out, cu_count
+    )
+    return out
+
+
 # moe
 def moe_sum(
     input: torch.Tensor,
